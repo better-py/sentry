@@ -43,11 +43,11 @@ def assemble_download(
     **kwargs
 ):
     try:
-        data_export = ExportedData.objects.get(id=data_export_id)
         if offset == 0:
             logger.info("dataexport.start", extra={"data_export_id": data_export_id})
             metrics.incr("dataexport.start", tags={"success": True}, sample_rate=1.0)
         logger.info("dataexport.run", extra={"data_export_id": data_export_id, "offset": offset})
+        data_export = ExportedData.objects.get(id=data_export_id)
     except ExportedData.DoesNotExist as error:
         if offset == 0:
             metrics.incr("dataexport.start", tags={"success": False}, sample_rate=1.0)
@@ -66,29 +66,37 @@ def assemble_download(
         # starting position for the next batch
         next_offset = offset + len(rows)
 
+        # store the headers separately to ensure at least the headers are written
+        if offset == 0:
+            with tempfile.TemporaryFile() as tf:
+                writer = csv.DictWriter(tf, headers, extrasaction="ignore")
+                writer.writeheader()
+                tf.seek(0)
+                bytes_written += store_export_chunk_as_blob(data_export, bytes_written, tf)
+
         with tempfile.TemporaryFile() as tf:
             writer = csv.DictWriter(tf, headers, extrasaction="ignore")
-            if offset == 0:
-                writer.writeheader()
             writer.writerows(rows)
             tf.seek(0)
 
-            bytes_written += store_export_chunk_as_blob(data_export, bytes_written, tf)
+            new_bytes_written = store_export_chunk_as_blob(data_export, bytes_written, tf)
+            bytes_written += new_bytes_written
     except ExportError as error:
         return data_export.email_failure(message=six.text_type(error))
     except BaseException as error:
         metrics.incr("dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0)
-        logger.info(
+        logger.error(
             "dataexport.error: %s",
             six.text_type(error),
             extra={"query": data_export.payload, "org": data_export.organization_id},
         )
         capture_exception(error)
-        return data_export.mail_failure(message="Internal processing failure")
+        return data_export.email_failure(message="Internal processing failure")
 
     if (
         rows
-        and len(rows) >= batch_size  # only == is needed, >= to be safe
+        and new_bytes_written
+        and len(rows) >= batch_size
         and (export_limit is None or next_offset < export_limit)
     ):
         assemble_download.delay(
@@ -104,19 +112,21 @@ def assemble_download(
 
 
 def get_processed(data_export, environment_id, batch_size, offset):
-    if data_export.query_type == ExportQueryType.ISSUES_BY_TAG:
-        processor, processed = process_issues_by_tag(
-            data_export, environment_id, batch_size, offset
-        )
-    elif data_export.query_type == ExportQueryType.DISCOVER:
-        processor, processed = process_discover(data_export, environment_id, batch_size, offset)
-    else:
-        logger.warn(
-            "dataexport.warn",
-            extra={"warning": "unknown_query_type", "query_type": data_export.query_type},
-        )
-        raise ExportError("Invalid query. Unexpected query type.")
-    return processor.header_fields, processed
+    try:
+        if data_export.query_type == ExportQueryType.ISSUES_BY_TAG:
+            processor, processed = process_issues_by_tag(
+                data_export, environment_id, batch_size, offset
+            )
+
+        elif data_export.query_type == ExportQueryType.DISCOVER:
+            processor, processed = process_discover(data_export, environment_id, batch_size, offset)
+
+        return processor.header_fields, processed
+    except ExportError as error:
+        metrics.incr("dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0)
+        logger.info("dataexport.error: {}".format(six.text_type(error)))
+        capture_exception(error)
+        raise error
 
 
 @handle_snuba_errors(logger)
@@ -164,6 +174,8 @@ def store_export_chunk_as_blob(data_export, bytes_written, fileobj, blob_size=DE
         )
 
         bytes_offset += blob.size
+
+        # there is a maximum file size allowed, so we need to make sure we don't exceed it
         if bytes_written + bytes_offset >= MAX_FILE_SIZE:
             transaction.set_rollback(True)
             return 0
@@ -185,26 +197,31 @@ def merge_export_blobs(data_export_id, **kwargs):
             )
             size = 0
             file_checksum = sha1(b"")
+
             for export_blob in ExportedDataBlob.objects.filter(data_export=data_export).order_by(
                 "offset"
             ):
                 blob = export_blob.blob
                 FileBlobIndex.objects.create(file=file, blob=blob, offset=size)
+                size += blob.size
                 blob_checksum = sha1(b"")
+
                 for chunk in blob.getfile().chunks():
                     blob_checksum.update(chunk)
                     file_checksum.update(chunk)
+
                 if blob.checksum != blob_checksum.hexdigest():
                     raise AssembleChecksumMismatch("Checksum mismatch")
-                size += blob.size
+
             file.size = size
             file.checksum = file_checksum.hexdigest()
             data_export.finalize_upload(file=file)
+
             logger.info("dataexport.end", extra={"data_export_id": data_export_id})
             metrics.incr("dataexport.end", sample_rate=1.0)
     except BaseException as error:
         metrics.incr("dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0)
-        logger.info(
+        logger.error(
             "dataexport.error: %s",
             six.text_type(error),
             extra={"query": data_export.payload, "org": data_export.organization_id},
@@ -215,143 +232,3 @@ def merge_export_blobs(data_export_id, **kwargs):
         else:
             message = "Internal processing failure."
         return data_export.email_failure(message=message)
-
-
-'''
-    # Create a temporary file
-    try:
-        with tempfile.TemporaryFile() as tf:
-            # Process the query based on its type
-            if data_export.query_type == ExportQueryType.ISSUES_BY_TAG:
-                process_issues_by_tag(
-                    data_export=data_export,
-                    file=tf,
-                    export_limit=export_limit,
-                    batch_size=batch_size,
-                    environment_id=environment_id,
-                )
-            elif data_export.query_type == ExportQueryType.DISCOVER:
-                process_discover(
-                    data_export=data_export,
-                    file=tf,
-                    export_limit=export_limit,
-                    batch_size=batch_size,
-                    environment_id=environment_id,
-                )
-            # Create a new File object and attach it to the ExportedData
-            tf.seek(0)
-            try:
-                with transaction.atomic():
-                    file = File.objects.create(
-                        name=data_export.file_name,
-                        type="export.csv",
-                        headers={"Content-Type": "text/csv"},
-                    )
-                    file.putfile(tf, logger=logger)
-                    data_export.finalize_upload(file=file)
-                    logger.info("dataexport.end", extra={"data_export_id": data_export_id})
-                    metrics.incr("dataexport.end", sample_rate=1.0)
-            except IntegrityError as error:
-                metrics.incr(
-                    "dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0
-                )
-                logger.info(
-                    "dataexport.error: {}".format(six.text_type(error)),
-                    extra={"query": data_export.payload, "org": data_export.organization_id},
-                )
-                capture_exception(error)
-                raise ExportError("Failed to save the assembled file")
-    except ExportError as error:
-        return data_export.email_failure(message=six.text_type(error))
-    except BaseException as error:
-        metrics.incr("dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0)
-        logger.info(
-            "dataexport.error: {}".format(six.text_type(error)),
-            extra={"query": data_export.payload, "org": data_export.organization_id},
-        )
-        capture_exception(error)
-        return data_export.email_failure(message="Internal processing failure")
-
-
-@handle_snuba_errors(logger)
-def process_issues_by_tag(data_export, file, export_limit, batch_size, environment_id):
-    """
-    Convert the tag query to a CSV, writing it to the provided file.
-    """
-    payload = data_export.query_info
-    try:
-        processor = IssuesByTagProcessor(
-            project_id=payload["project"][0],
-            group_id=payload["group"],
-            key=payload["key"],
-            environment_id=environment_id,
-        )
-    except ExportError as error:
-        metrics.incr("dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0)
-        logger.info("dataexport.error: {}".format(six.text_type(error)))
-        capture_exception(error)
-        raise error
-
-    writer = create_writer(file, processor.header_fields)
-    iteration = 0
-    is_completed = False
-    while not is_completed:
-        offset = batch_size * iteration
-        next_offset = batch_size * (iteration + 1)
-        is_exceeding_limit = export_limit and export_limit < next_offset
-        gtv_list_unicode = processor.get_serialized_data(limit=batch_size, offset=offset)
-        # TODO(python3): Remove next line once the 'csv' module has been updated to Python 3
-        # See associated comment in './utils.py'
-        gtv_list = convert_to_utf8(gtv_list_unicode)
-        if is_exceeding_limit:
-            # Since the next offset will pass the export_limit, just write the remainder
-            writer.writerows(gtv_list[: export_limit % batch_size])
-        else:
-            writer.writerows(gtv_list)
-            iteration += 1
-        # If there are no returned results, or we've passed the export_limit, stop iterating
-        is_completed = len(gtv_list) == 0 or is_exceeding_limit
-
-
-@handle_snuba_errors(logger)
-def process_discover(data_export, file, export_limit, batch_size, environment_id):
-    """
-    Convert the discovery query to a CSV, writing it to the provided file.
-    """
-    try:
-        processor = DiscoverProcessor(
-            discover_query=data_export.query_info, organization_id=data_export.organization_id
-        )
-    except ExportError as error:
-        metrics.incr("dataexport.error", tags={"error": six.text_type(error)}, sample_rate=1.0)
-        logger.info("dataexport.error: {}".format(six.text_type(error)))
-        capture_exception(error)
-        raise error
-
-    writer = create_writer(file, processor.header_fields)
-    iteration = 0
-    is_completed = False
-    while not is_completed:
-        offset = batch_size * iteration
-        next_offset = batch_size * (iteration + 1)
-        is_exceeding_limit = export_limit and export_limit < next_offset
-        raw_data_unicode = processor.data_fn(offset=offset, limit=batch_size)["data"]
-        # TODO(python3): Remove next line once the 'csv' module has been updated to Python 3
-        # See associated comment in './utils.py'
-        raw_data = convert_to_utf8(raw_data_unicode)
-        raw_data = processor.handle_fields(raw_data)
-        if is_exceeding_limit:
-            # Since the next offset will pass the export_limit, just write the remainder
-            writer.writerows(raw_data[: export_limit % batch_size])
-        else:
-            writer.writerows(raw_data)
-            iteration += 1
-        # If there are no returned results, or we've passed the export_limit, stop iterating
-        is_completed = len(raw_data) == 0 or is_exceeding_limit
-
-
-def create_writer(file, fields):
-    writer = csv.DictWriter(file, fields, extrasaction="ignore")
-    writer.writeheader()
-    return writer
-'''
