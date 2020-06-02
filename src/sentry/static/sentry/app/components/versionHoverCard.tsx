@@ -1,5 +1,7 @@
 import React from 'react';
 import styled from '@emotion/styled';
+import withRelease from 'app/utils/withRelease';
+import withRepositories from 'app/utils/withRepositories';
 
 import {t} from 'app/locale';
 import AvatarList from 'app/components/avatar/avatarList';
@@ -12,8 +14,6 @@ import RepoLabel from 'app/components/repoLabel';
 import TimeSince from 'app/components/timeSince';
 import space from 'app/styles/space';
 import withApi from 'app/utils/withApi';
-import withRelease from 'app/utils/withRelease';
-import withRepositories from 'app/utils/withRepositories';
 import Clipboard from 'app/components/clipboard';
 import {IconCopy} from 'app/icons';
 import Version from 'app/components/version';
